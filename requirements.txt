@@ -1,0 +1,4 @@
+ccxt==4.1.59
+pandas==2.1.1
+python-telegram-bot==20.6
+flask==3.0.0
