@@ -42,58 +42,35 @@ def keep_alive():
     t.start()
 
 # ==========================================
-# 3. STRATEGY ENGINE (24/7 ROLLING LIQUIDITY)
+# 3. STRATEGY ENGINE (15M SWEEP & RECLAIM)
 # ==========================================
 def analyze_market(df_15, df_5):
     try:
         if len(df_15) < 205: return None # Need enough data for EMA 200
 
         # --- STEP 1: DEFINE ROLLING LIQUIDITY (15M) ---
-        # Current completed 15M candle (index -2)
-        curr_15 = df_15.iloc[-2]
+        curr_15 = df_15.iloc[-2] # The just-completed candle
         
-        # The 50 candles before the current one
+        # The 50 candles BEFORE the sweeping candle
         range_data = df_15.iloc[-LOOKBACK-2 : -2]
         
         swing_high = range_data['high'].max()
         swing_low = range_data['low'].min()
         ema200 = df_15['ema200'].iloc[-2]
 
-        # --- STEP 2: DETECT THE SWEEP & TREND CONFLUENCE ---
-        sweep_type = None
-        sweep_wick_extreme = None
+        # We use a $2.50 buffer for Gold to avoid getting stopped out by crypto volatility
+        GOLD_BUFFER = 2.50 
+        candle_time = curr_15['time']
+
+        # --- STEP 2: DETECT SWEEP, RECLAIM & TREND ---
         
-        # Bearish Sweep: Wick above High, close below High + DOWN TREND
+        # 🔴 SHORT SETUP: Wick above Swing High, but Close stayed BELOW Swing High
         if curr_15['high'] > swing_high and curr_15['close'] < swing_high:
-            if curr_15['close'] < ema200: # Trend Filter
-                sweep_type = "SHORT"
-                sweep_wick_extreme = curr_15['high']
-            
-        # Bullish Sweep: Wick below Low, close above Low + UP TREND
-        elif curr_15['low'] < swing_low and curr_15['close'] > swing_low:
-            if curr_15['close'] > ema200: # Trend Filter
-                sweep_type = "LONG"
-                sweep_wick_extreme = curr_15['low']
-
-        if not sweep_type: return None
-
-        # --- STEP 3: DETECT MSS & FVG (5M TIMEFRAME) ---
-        # Look at the last 3 completed 5M candles: c1 (Oldest), c2 (Middle), c3 (Newest)
-        c1 = df_5.iloc[-4]
-        c2 = df_5.iloc[-3]
-        c3 = df_5.iloc[-2]
-        
-        candle_time = c3['time'] 
-
-        # We will use a $0.50 buffer for Gold to avoid getting stopped out by noise
-        GOLD_BUFFER = 0.50 
-
-        if sweep_type == "SHORT":
-            # Bearish FVG Check: c1 Low > c3 High (Gap down) AND bearish close
-            if c1['low'] > c3['high'] and c3['close'] < c3['open']:
-                entry = c3['high']  # Limit entry at the bottom of the gap
-                sl = sweep_wick_extreme + GOLD_BUFFER 
-                tp = swing_low      # Target the opposing liquidity
+            if curr_15['close'] < ema200: # Trend Filter: Must be below 200 EMA
+                
+                entry = curr_15['close'] # Enter exactly at the close of the reclaim
+                sl = curr_15['high'] + GOLD_BUFFER # Stop above the sweep wick
+                tp = swing_low # Target the opposing liquidity pool
                 
                 risk = abs(entry - sl)
                 reward = abs(entry - tp)
@@ -102,12 +79,13 @@ def analyze_market(df_15, df_5):
                 if rr >= RR_MINIMUM:
                     return ("SHORT", entry, sl, tp, candle_time, rr)
 
-        if sweep_type == "LONG":
-            # Bullish FVG Check: c1 High < c3 Low (Gap up) AND bullish close
-            if c1['high'] < c3['low'] and c3['close'] > c3['open']:
-                entry = c3['low']   # Limit entry at the top of the gap
-                sl = sweep_wick_extreme - GOLD_BUFFER 
-                tp = swing_high     # Target the opposing liquidity
+        # 🟢 LONG SETUP: Wick below Swing Low, but Close stayed ABOVE Swing Low
+        if curr_15['low'] < swing_low and curr_15['close'] > swing_low:
+            if curr_15['close'] > ema200: # Trend Filter: Must be above 200 EMA
+                
+                entry = curr_15['close'] # Enter exactly at the close of the reclaim
+                sl = curr_15['low'] - GOLD_BUFFER # Stop below the sweep wick
+                tp = swing_high # Target the opposing liquidity pool
                 
                 risk = abs(entry - sl)
                 reward = abs(tp - entry)
@@ -117,7 +95,7 @@ def analyze_market(df_15, df_5):
                     return ("LONG", entry, sl, tp, candle_time, rr)
 
     except Exception as e:
-        pass
+        print(f"Analysis Error: {e}")
         
     return None
 
