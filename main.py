@@ -11,18 +11,13 @@ from threading import Thread
 # ==========================================
 # 1. CONFIGURATION
 # ==========================================
-# Binance USDT-Margined Perpetual for Gold
-SYMBOL = 'XAU/USDT:USDT' 
-LOOKBACK = 50       # Rolling liquidity lookback (50 candles on 15M = 12.5 hours)
-RR_MINIMUM = 1.5    # Minimum Risk:Reward ratio
+SYMBOL = 'XAU/USDT:USDT'  # Binance Gold Perpetual
 
-# Environment Variables (Set these in Render)
+# Environment Variables
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID", "YOUR_CHAT_ID")
 
 last_signal = None 
-
-# Initialize Exchange (Public Mode ONLY)
 exchange = ccxt.binanceusdm({'enableRateLimit': True})
 
 # ==========================================
@@ -31,7 +26,7 @@ exchange = ccxt.binanceusdm({'enableRateLimit': True})
 app = Flask('')
 @app.route('/')
 def home():
-    return "24/7 Gold Signal Bot is running!"
+    return "Gold 5M Scalp Bot is running!"
 
 def run_http():
     port = int(os.environ.get("PORT", 8080))
@@ -42,57 +37,76 @@ def keep_alive():
     t.start()
 
 # ==========================================
-# 3. STRATEGY ENGINE (15M SWEEP & RECLAIM)
+# 3. STRATEGY ENGINE (5M MEAN REVERSION)
 # ==========================================
-def analyze_market(df_15, df_5):
+def calculate_indicators(df):
+    """Calculates Bollinger Bands and RSI natively without pandas-ta"""
+    # 20-Period Simple Moving Average (Middle Band)
+    df['sma20'] = df['close'].rolling(window=20).mean()
+    
+    # Standard Deviation for Bollinger Bands
+    df['stddev'] = df['close'].rolling(window=20).std()
+    
+    # Upper and Lower Bands (2 Standard Deviations)
+    df['upper_band'] = df['sma20'] + (2 * df['stddev'])
+    df['lower_band'] = df['sma20'] - (2 * df['stddev'])
+    
+    # Native RSI Calculation (14 period)
+    delta = df['close'].diff()
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    avg_gain = gain.ewm(alpha=1/14, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/14, adjust=False).mean()
+    rs = avg_gain / avg_loss
+    df['rsi'] = 100 - (100 / (1 + rs))
+    
+    return df
+
+def analyze_scalp(df):
     try:
-        if len(df_15) < 205: return None # Need enough data for EMA 200
+        if len(df) < 25: return None
 
-        # --- STEP 1: DEFINE ROLLING LIQUIDITY (15M) ---
-        curr_15 = df_15.iloc[-2] # The just-completed candle
+        df = calculate_indicators(df)
+
+        # prev = The candle that spiked outside the band
+        # curr = The just-completed candle that confirms the reversal
+        prev = df.iloc[-3]
+        curr = df.iloc[-2]
         
-        # The 50 candles BEFORE the sweeping candle
-        range_data = df_15.iloc[-LOOKBACK-2 : -2]
+        candle_time = curr['time']
         
-        swing_high = range_data['high'].max()
-        swing_low = range_data['low'].min()
-        ema200 = df_15['ema200'].iloc[-2]
+        # Stop Loss Buffer for Gold
+        BUFFER = 1.00 
 
-        # We use a $2.50 buffer for Gold to avoid getting stopped out by crypto volatility
-        GOLD_BUFFER = 2.50 
-        candle_time = curr_15['time']
+        # 🔴 SHORT SCALP (Price pumped too high, snapping back down)
+        # 1. Previous candle went ABOVE upper band
+        # 2. Current candle is RED (Close < Open) and closed BACK INSIDE the band
+        # 3. RSI shows it was overbought (> 60)
+        if prev['high'] > prev['upper_band'] and curr['close'] < curr['open'] and curr['close'] < curr['upper_band']:
+            if curr['rsi'] > 60:
+                
+                entry = curr['close']
+                tp = curr['sma20'] # Target the middle moving average
+                sl = max(prev['high'], curr['high']) + BUFFER
+                
+                # Check if TP is worth it (At least $0.80 move on gold)
+                if abs(entry - tp) > 0.80:
+                    return ("SHORT", entry, sl, tp, candle_time)
 
-        # --- STEP 2: DETECT SWEEP, RECLAIM & TREND ---
-        
-        # 🔴 SHORT SETUP: Wick above Swing High, but Close stayed BELOW Swing High
-        if curr_15['high'] > swing_high and curr_15['close'] < swing_high:
-            if curr_15['close'] < ema200: # Trend Filter: Must be below 200 EMA
+        # 🟢 LONG SCALP (Price dumped too low, snapping back up)
+        # 1. Previous candle went BELOW lower band
+        # 2. Current candle is GREEN (Close > Open) and closed BACK INSIDE the band
+        # 3. RSI shows it was oversold (< 40)
+        if prev['low'] < prev['lower_band'] and curr['close'] > curr['open'] and curr['close'] > prev['lower_band']:
+            if curr['rsi'] < 40:
                 
-                entry = curr_15['close'] # Enter exactly at the close of the reclaim
-                sl = curr_15['high'] + GOLD_BUFFER # Stop above the sweep wick
-                tp = swing_low # Target the opposing liquidity pool
+                entry = curr['close']
+                tp = curr['sma20'] # Target the middle moving average
+                sl = min(prev['low'], curr['low']) - BUFFER
                 
-                risk = abs(entry - sl)
-                reward = abs(entry - tp)
-                rr = round(reward / risk, 2) if risk > 0 else 0
-                
-                if rr >= RR_MINIMUM:
-                    return ("SHORT", entry, sl, tp, candle_time, rr)
-
-        # 🟢 LONG SETUP: Wick below Swing Low, but Close stayed ABOVE Swing Low
-        if curr_15['low'] < swing_low and curr_15['close'] > swing_low:
-            if curr_15['close'] > ema200: # Trend Filter: Must be above 200 EMA
-                
-                entry = curr_15['close'] # Enter exactly at the close of the reclaim
-                sl = curr_15['low'] - GOLD_BUFFER # Stop below the sweep wick
-                tp = swing_high # Target the opposing liquidity pool
-                
-                risk = abs(entry - sl)
-                reward = abs(tp - entry)
-                rr = round(reward / risk, 2) if risk > 0 else 0
-                
-                if rr >= RR_MINIMUM:
-                    return ("LONG", entry, sl, tp, candle_time, rr)
+                # Check if TP is worth it (At least $0.80 move on gold)
+                if abs(tp - entry) > 0.80:
+                    return ("LONG", entry, sl, tp, candle_time)
 
     except Exception as e:
         print(f"Analysis Error: {e}")
@@ -105,59 +119,54 @@ def analyze_market(df_15, df_5):
 async def scan_market(app):
     global last_signal
     bot = Bot(token=BOT_TOKEN)
-    print(f"24/7 Scanner Started for {SYMBOL}...")
+    print(f"5M Scalp Scanner Started for {SYMBOL}...")
     
     while True:
         try:
-            # Fetch Data (Need 250 candles for 15M to calculate EMA 200 properly)
-            bars_15m = await exchange.fetch_ohlcv(SYMBOL, timeframe='15m', limit=250)
-            bars_5m = await exchange.fetch_ohlcv(SYMBOL, timeframe='5m', limit=15)
+            # We ONLY need the 5-minute chart now. Faster and highly responsive.
+            bars_5m = await exchange.fetch_ohlcv(SYMBOL, timeframe='5m', limit=50)
             
-            if bars_15m and bars_5m:
-                df_15 = pd.DataFrame(bars_15m, columns=['timestamp', 'open', 'high', 'low', 'close', 'vol'])
+            if bars_5m:
                 df_5 = pd.DataFrame(bars_5m, columns=['timestamp', 'open', 'high', 'low', 'close', 'vol'])
-                
-                # Calculate Indicators
-                df_15['ema200'] = df_15['close'].ewm(span=200, adjust=False).mean()
-                
-                # Convert timestamps
-                for df in [df_15, df_5]:
-                    df['time'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
+                df_5['time'] = pd.to_datetime(df_5['timestamp'], unit='ms', utc=True)
 
-                # Analyze
-                signal_data = analyze_market(df_15, df_5)
+                signal_data = analyze_scalp(df_5)
                 
                 if signal_data:
-                    direction, entry, sl, tp, candle_time, rr = signal_data
+                    direction, entry, sl, tp, candle_time = signal_data
                     sig_id = f"{direction}_{candle_time}"
                     
                     if last_signal != sig_id:
+                        
+                        risk = abs(entry - sl)
+                        reward = abs(tp - entry)
+                        rr = round(reward / risk, 2) if risk > 0 else 0
+                        
                         emoji = "🔴" if direction == "SHORT" else "🟢"
                         
                         msg = (
-                            f"{emoji} **GOLD SWEEP (24/7)** {emoji}\n\n"
-                            f"🪙 **Asset:** {SYMBOL}\n"
-                            f"⚡ **Action:** **{direction}** Limit\n"
+                            f"{emoji} **GOLD 5M SCALP** {emoji}\n\n"
+                            f"⚡ **Action:** **{direction}** Market\n"
                             f"-------------------------\n"
-                            f"📥 **Entry Limit:** `${entry:.2f}`\n"
+                            f"📥 **Entry:** `${entry:.2f}`\n"
+                            f"🎯 **Target (SMA):** `${tp:.2f}`\n"
                             f"🛑 **Stop Loss:** `${sl:.2f}`\n"
-                            f"🎯 **Take Profit:** `${tp:.2f}`\n"
                             f"⚖️ **R:R Ratio:** {rr}R\n"
                             f"-------------------------\n"
-                            f"📝 *Logic: 15M Liquidity Swept with Trend. 5M FVG Formed.*"
+                            f"📝 *Logic: Bollinger Band Rejection + RSI*"
                         )
                         
                         await bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='Markdown')
                         last_signal = sig_id
-                        print(f"Alert Sent: {direction} @ {entry} (RR: {rr})")
+                        print(f"Alert Sent: {direction} @ {entry}")
 
         except Exception as e:
             pass
             
-        await asyncio.sleep(60) # Scan every 60 seconds
+        await asyncio.sleep(20) # Check every 20 seconds for fast scalping
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"🦅 **24/7 Gold Signal Bot Online.**\nScanning for High Probability (>1.5R) Sweeps...")
+    await update.message.reply_text(f"🦅 **Gold 5M Scalper Bot Online.**\nHunting for quick mean-reversion pullbacks...")
 
 if __name__ == '__main__':
     keep_alive()
